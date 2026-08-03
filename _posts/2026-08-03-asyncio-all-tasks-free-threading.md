@@ -6,7 +6,8 @@ tags: [cpython, asyncio, free-threading, concurrency]
 ---
 
 The job of `asyncio.all_tasks()` is to return all active tasks in the event loop. 
-In builds with the GIL disabled, it could return fewer tasks than there actually are. 
+In builds with the GIL disabled, called from a thread other than the one running
+the loop, it could return fewer tasks than there actually are. 
 But how is this possible? Let's take a look.
 
 ## The function that's supposed to see everything
@@ -15,18 +16,20 @@ The `asyncio.all_tasks()` function iterates through all active tasks in the even
 It is used for: graceful shutdown, waiting for in-flight work to finish, 
 monitoring (counting running tasks), and test suites (checking for leaks).
 
-If a task is not in this list, the shutdown function can silently drop it.
+If a task is not in this list, a shutdown routine driving the loop from another thread can silently drop it.
 
 ## Two new things, and a bug that only lives where they meet
 
 An **eager task** runs synchronously until the first real suspension point, 
-and if the coroutine completes without being suspended, it does not enter the event loop at all.
+and if the coroutine completes without being suspended, it never gets scheduled on the event loop at all.
 
-The free-threading build eliminates the GIL, so threads can be truly parallel, executing Python bytecode, 
-including the few lines that register a new task in the loop's bookkeeping.
+The free-threading build eliminates the GIL, so a task created by the loop's thread
+can be examined by another thread in parallel - and to hand it out safely,
+the runtime has to incref an object it doesn't own.
 
-None of this is a problem in itself. With regular tasks, everything works fine. 
-With **eager tasks** under GIL, the tasks behave as intended. The bug needed both.
+None of this is a problem in itself. With regular tasks, everything works fine.
+With **eager tasks** under GIL, the tasks behave as intended. The bug needed both -
+and it was not a race: with both in place, the task went missing every single time.
 
 ## Finding it
 
@@ -41,10 +44,10 @@ So I stopped guessing and went into examining task_init.
 
 ## The bug, and the fix
 
-In the free-threaded build, `asyncio.all_tasks()` collects tasks through weak
-references, and `_Py_TryIncref` from a non-owning thread only works if the
-task has its maybe-weakref bit set. The old code set it *after* the eager-start
-logic:
+In the free-threaded build, `asyncio.all_tasks()` collects tasks from a linked
+list of borrowed references, and `_Py_TryIncref` from a non-owning thread only
+works if the task has its maybe-weakref bit set. The
+old code set it *after* the eager-start logic:
 
 ```c
 if (eager_start) {
@@ -79,13 +82,15 @@ if (eager_start) {
 }
 ```
 
-It landed in 3.16 and was also backported to 3.15 and 3.14. The PR is
+The fix landed in 3.16 and was also backported to 3.15 and 3.14. The PR is
 [python/cpython#152022](https://github.com/python/cpython/pull/152022).
 
 ## The takeaway
 
-Many asyncio invariants were protected by the presence of the GIL - 
-setting up cross-thread state late, or skipping it on a fast path, was safe because no other thread was there to notice.
-Free-threading takes this away, and any code that previously relied on the GIL guarantee 
-is now exposed. This was one such case, and perhaps far from the only one, 
-and they all have one thing in common: something is safe by accident, until it isn't.
+Free-threading doesn't just remove the GIL, it adds per-object bookkeeping that has no
+counterpart in the default build. `_PyObject_SetMaybeWeakref` compiles to nothing under the GIL,
+so a missing call is invisible to every test that runs there and nothing catches it at runtime
+either: `_Py_TryIncref` returns 0 and the task is skipped without an error.
+One path through `task_init` had the call, the other returned before reaching it.
+Every early return in a function like this is a chance to skip setup that only matters
+to other threads, and this one will not be the last.
