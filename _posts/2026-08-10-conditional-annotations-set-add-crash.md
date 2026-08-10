@@ -1,7 +1,7 @@
 ---
 layout: post
 title: Two lines of Python that segfault the interpreter
-subtitle: SET_ADD trusted the compiler, and PEP 649 quietly handed user code a way to break that trust
+subtitle: SET_ADD trusted the compiler, and PEP 749 quietly handed user code a way to break that trust
 tags: [cpython, annotations, bytecode, compiler]
 ---
 
@@ -34,7 +34,7 @@ most people have never heard of.
 
 Python 3.14 added [PEP 649](https://peps.python.org/pep-0649/) and
 [PEP 749](https://peps.python.org/pep-0749/): annotations are no longer evaluated at
-definition time, they are moved into a lazily-called `__annotate__` function.
+definition time; they are moved into a lazily-called `__annotate__` function.
 
 That created a bookkeeping problem. Libraries write this all the time:
 
@@ -83,7 +83,7 @@ and on the other side, inside `__annotate__`:
 ```
 
 Note the opcodes: `STORE_NAME` and `LOAD_NAME`. This is not a hidden stack slot — it is an ordinary module global, 
-sitting in globals() next to everything else you wrote, under a name anyone can assign to. That is the whole bug.
+sitting in `globals()` next to everything else you wrote, under a name anyone can assign to. That is the whole bug.
 
 ## Why SET_ADD never checked
 
@@ -106,7 +106,7 @@ of a small `int`, so the interpreter reads garbage as a hash table pointer and
 dereferences it. Classic type confusion.
 
 PEP 749 gave the opcode a second caller, and that one loads its operand by name. 
-Nobody removed a check, the check was never needed until the ground moved.
+Nobody removed a check; the check was never needed until the ground moved.
 
 The issue was reported by [Lydxn](https://github.com/python/cpython/issues/154902) on
 July 30. I picked it up and ended up writing two different fixes for it, which turned
@@ -178,7 +178,7 @@ Both landed on August 4–5: [#155071](https://github.com/python/cpython/pull/15
 ## The takeaway
 
 Every "the compiler guarantees this" comment is a contract between two pieces of code
-that may not stay neighbours. `SET_ADD` was written for set comprehensions and was
+that may not stay neighbors. `SET_ADD` was written for set comprehensions and was
 correct for as long as that was its only caller. Years later a new feature needed to
 add integers to a set, `SET_ADD` was sitting right there, and the invariant that made
 it safe — *the operand is unreachable from Python* — was not written down anywhere the
