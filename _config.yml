@@ -26,10 +26,11 @@ navbar-links:
 # --- Logo --- #
 ################
 
-# Image to show in the navigation bar - works best with a square image.
-# Drop a square photo at assets/img/avatar.jpeg, or comment this line out to hide it.
-avatar: "/assets/img/avatar.jpeg"
-round-avatar: true
+# No avatar in the navbar. With `avatar` unset, nav.html skips the whole
+# .avatar-container block, so there is no image and no empty circle either.
+# To bring it back: drop a square photo at assets/img/avatar.jpeg and uncomment.
+#avatar: "/assets/img/avatar.jpeg"
+#round-avatar: true
 
 #####################################
 # --- Footer social media links --- #

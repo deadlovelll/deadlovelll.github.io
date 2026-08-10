@@ -45,8 +45,8 @@ if TYPE_CHECKING:
 
 `__annotate__` runs later, long after the `if` has been decided, so it has no idea
 whether that branch was taken. PEP 749 solves it with a side channel: every annotated
-assignment in a class or module body gets a unique integer, and the body maintains a
-set of the ones it actually executed.
+assignment at module level — and every conditional one in a class body — gets a unique
+integer, and the enclosing body maintains a set of the ones it actually executed.
 
 You can see the whole mechanism in the disassembly of a two-annotation module:
 
@@ -87,10 +87,11 @@ sitting in `globals()` next to everything else you wrote, under a name anyone ca
 
 ## Why SET_ADD never checked
 
-Before 3.14, `SET_ADD` had exactly one caller: set comprehensions. 
-There the set comes from a `BUILD_SET` a few instructions earlier, sits on the stack, 
-and never gets a name — no Python code can reach it, let alone rebind it. 
-The compiler knows the operand is a set because the compiler is what put it there. So the opcode skips the check.
+Before 3.14, every `SET_ADD` the compiler emitted — in set comprehensions and in set
+displays alike — took its operand straight from a `BUILD_SET` a few instructions
+earlier. The set sits on the stack and never gets a name, so no Python code can reach
+it, let alone rebind it. The compiler knows the operand is a set because the compiler
+is what put it there. So the opcode skips the check.
 
 ```c
 inst(SET_ADD, (set, unused[oparg-1], v -- set, unused[oparg-1])) {
@@ -142,7 +143,7 @@ and the code generator stopped emitting `SET_ADD` for annotations entirely:
 ADDOP_I(c, loc, CALL_INTRINSIC_2, INTRINSIC_ADD_CONDITIONAL_ANNOTATION);
 ```
 
-Set comprehensions keep their fast, unchecked opcode. Annotations get an operation
+Set comprehensions and displays keep their fast, unchecked opcode. Annotations get an operation
 that owns its own invariant and can name the variable in the error message, because
 that intrinsic exists for nothing else.
 
@@ -178,8 +179,8 @@ Both landed on August 4–5: [#155071](https://github.com/python/cpython/pull/15
 ## The takeaway
 
 Every "the compiler guarantees this" comment is a contract between two pieces of code
-that may not stay neighbors. `SET_ADD` was written for set comprehensions and was
-correct for as long as that was its only caller. Years later a new feature needed to
+that may not stay neighbors. `SET_ADD` was written for set comprehensions and
+displays, and was correct for as long as those were its only callers. Years later a new feature needed to
 add integers to a set, `SET_ADD` was sitting right there, and the invariant that made
 it safe — *the operand is unreachable from Python* — was not written down anywhere the
 new caller would trip over it.
