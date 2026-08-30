@@ -1,7 +1,7 @@
 ---
 layout: post
 title: Two lines of Python that segfault the interpreter
-subtitle: SET_ADD trusted the compiler, and PEP 749 quietly handed user code a way to break that trust
+subtitle: PEP 749 put the annotation set in globals(), and SET_ADD never checked that its operand was still a set
 tags: [cpython, annotations, bytecode, compiler]
 ---
 
@@ -30,11 +30,11 @@ interesting part is that there is no traceback at all.
 evaluated eagerly anymore. The problem is the first line, which reassigns a name
 most people have never heard of.
 
-## The set nobody told you about
+## The set PEP 749 put in your globals()
 
 Python 3.14 added [PEP 649](https://peps.python.org/pep-0649/) and
 [PEP 749](https://peps.python.org/pep-0749/): annotations are no longer evaluated at
-definition time; they are moved into a lazily-called `__annotate__` function.
+definition time, and are moved into a lazily-called `__annotate__` function.
 
 That created a bookkeeping problem. Libraries write this all the time:
 
@@ -107,7 +107,7 @@ of a small `int`, so the interpreter reads garbage as a hash table pointer and
 dereferences it. Classic type confusion.
 
 PEP 749 gave the opcode a second caller, and that one loads its operand by name. 
-Nobody removed a check; the check was never needed until the ground moved.
+Nobody removed a check. The check was never needed until a second caller appeared.
 
 The issue was reported by [Lydxn](https://github.com/python/cpython/issues/154902) on
 July 30. I picked it up and ended up writing two different fixes for it, which turned
@@ -176,7 +176,7 @@ luxury only the dedicated intrinsic can afford.
 Both landed on August 4–5: [#155071](https://github.com/python/cpython/pull/155071) for
 3.15 and [#155072](https://github.com/python/cpython/pull/155072) for 3.14.
 
-## The takeaway
+## An invariant with no owner
 
 Every "the compiler guarantees this" comment is a contract between two pieces of code
 that may not stay neighbors. `SET_ADD` was written for set comprehensions and
@@ -185,7 +185,7 @@ add integers to a set, `SET_ADD` was sitting right there, and the invariant that
 it safe — *the operand is unreachable from Python* — was not written down anywhere the
 new caller would trip over it.
 
-The interesting part of this fix is not the guard. It is that a released branch and a
-development branch deserved genuinely different answers to the same crash: one
-defensive, one structural. Backport policy is not an obstacle to routing around — it
-is a constraint that tells you which of the two fixes you are allowed to be proud of.
+Two branches, two different right answers to one crash: defensive where the bytecode
+is frozen, structural where it is not. Backport policy is not an obstacle to route
+around, it is the constraint that decides which of the two fixes you are allowed to
+ship.

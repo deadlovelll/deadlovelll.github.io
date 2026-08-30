@@ -1,18 +1,16 @@
 ---
 layout: post
 title: When asyncio.all_tasks() started forgetting tasks under free-threading
-subtitle: How a task hid from the function whose only job is to list it
+subtitle: Under free-threading, a task could be running and missing from all_tasks() at the same time
 tags: [cpython, asyncio, free-threading, concurrency]
 ---
 
 The job of `asyncio.all_tasks()` is to return all active tasks in the event loop. 
 In builds with the GIL disabled, called from a thread other than the one running
-the loop, it could return fewer tasks than there actually are. 
-But how is this possible? Let's take a look.
+the loop, it could return fewer tasks than there actually are.
 
-## The function that's supposed to see everything
+## What the list is used for
 
-The `asyncio.all_tasks()` function iterates through all active tasks in the event loop. 
 It is used for: graceful shutdown, waiting for in-flight work to finish, 
 monitoring (counting running tasks), and test suites (checking for leaks).
 
@@ -40,7 +38,7 @@ unregistered again, so never appearing in `asyncio.all_tasks()` is correct behav
 But that wasn't the case: the task was still running.
 The other obvious suspect, a registry being modified from one thread while another is iterating it, 
 didn't hold water either — the registry was fine, and the task was in it. Whatever was dropping it happened on the way out.
-So I stopped guessing and went into examining task_init.
+So I stopped guessing and went into `task_init`.
 
 ## The bug, and the fix
 
@@ -85,9 +83,9 @@ if (eager_start) {
 The fix landed in 3.16 and was also backported to 3.15 and 3.14. The PR is
 [python/cpython#152022](https://github.com/python/cpython/pull/152022).
 
-## The takeaway
+## The GIL build cannot catch this
 
-Free-threading doesn't just remove the GIL, it adds per-object bookkeeping that has no
+Free-threading removes the GIL and adds per-object bookkeeping that has no
 counterpart in the default build. `_PyObject_SetMaybeWeakref` compiles to nothing under the GIL,
 so a missing call is invisible to every test that runs there and nothing catches it at runtime
 either: `_Py_TryIncref` returns 0 and the task is skipped without an error.
