@@ -1,7 +1,7 @@
 ---
 layout: post
 title: Reading __dict__ once permanently deoptimizes attribute access
-subtitle: Since 3.11 attribute access has not been a dict lookup, and reading __dict__ once hands the values array to a real dict for good
+subtitle: Since 3.11 attribute access has not been a dict lookup, and reading __dict__ once takes the specialized path away for good
 tags: [cpython, performance, free-threading, bytecode]
 ---
 
@@ -27,7 +27,7 @@ Measured with `pyperf` on an M3, CPython 3.14.6: 33.0 ms against 24.8 ms, a rati
 through the instance dict and hashing a string costs something, has been wrong since 3.11,
 and it is still the explanation you will find everywhere.
 
-Putting the dict lookup back takes one line, leaves the loop byte-for-byte identical, and
+Taking the fast path away takes one line, leaves the loop byte-for-byte identical, and
 costs more than the hoisting saves.
 
 ## The loop stops using LOAD_ATTR after a few runs
@@ -112,8 +112,8 @@ op(_LOAD_ATTR_INSTANCE_VALUE, (offset/1, owner -- attr)) {
     ...
 ```
 
-A fixed byte offset into the object, baked into the instruction's inline cache the first
-time it ran. Since PEP 659 and `Py_TPFLAGS_INLINE_VALUES`, an ordinary instance keeps its
+A fixed byte offset into the object, baked into the instruction's inline cache when it
+specialized. Since 3.13's `Py_TPFLAGS_INLINE_VALUES`, an ordinary instance keeps its
 attributes in an inline values array, and the specialized opcode reads straight out of it
 after checking the type's version tag and that the values are still there, so the
 `__dict__` everyone is picturing does not exist yet.
@@ -141,7 +141,7 @@ attribute out and what is left is the bare loop: that ~24 ms is mostly `FOR_ITER
 `BINARY_OP_ADD_INT`. The 1.33x is 8 ms of attribute round-trips on top of 24 ms of loop
 that hoisting does not touch.
 
-## Putting the lookup back
+## Taking the fast path away
 
 `Materialized` has the same `process` body as `Attr`. The only difference is one line
 somewhere else entirely:
@@ -157,9 +157,9 @@ o.__dict__
 | `materialized` | 50.6 ms +- 1.2 | 59.4 ms +- 0.5 |
 | ratio | **1.54 +- 0.04** | **1.75 +- 0.02** |
 
-Reading `__dict__` materializes it, the new dict wraps the same values array, and every
-attribute access on that object goes back to a real dict for the rest of its life. The loop
-that took 33 ms takes 51 ms. That is an 18 ms penalty, where hoisting saved 8 ms.
+Reading `__dict__` materializes it, the new dict wraps the same values array, and the
+object is off the specialized path for the rest of its life. The loop that took 33 ms
+takes 51 ms. That is an 18 ms penalty, where hoisting saved 8 ms.
 
 Other things materialize it too:
 
@@ -205,9 +205,9 @@ far - it takes an earlier branch that fails as soon as it sees a non-NULL dict.
 
 I assumed one materialized instance would poison the shared code object for every other
 instance of the class, since every instance runs through the same instruction with the same
-inline cache. It does deoptimize while the materialized instance is running, but clean instances
-re-specialize it right back, and a clean instance running through a "poisoned" code object
-measured 1.02x, which is to say nothing.
+inline cache. The store deoptimizes while the materialized instance is running, but clean
+instances re-specialize it right back, and a clean instance running through a "poisoned"
+code object measured 1.02x, which is to say nothing.
 
 `__slots__` was the other thing I had wrong. `slots / attr` came out 0.98 +- 0.03 with the
 GIL and 1.00 +- 0.01 without, so a slotted instance and an ordinary one read attributes at
@@ -237,8 +237,8 @@ Every benchmark above, rerun on the same machine on a build configured with `--d
 ```
 
 The loop itself is *faster* without the GIL, and what costs more is attribute access: the
-specialized round-trip goes from 8.2 to 10.2 ns, and the materialization penalty from 17.6
-to 25.4 ns.
+specialized round-trip goes from 8.2 to 10.1 ns, and the materialization penalty, on the
+generic path, from 17.6 to 25.4 ns.
 
 That `FT_ATOMIC_LOAD_PTR_ACQUIRE` above is an acquire-ordered load where the GIL build has
 a plain one, and then there is a step the GIL build does not have at all:
@@ -296,7 +296,7 @@ values array cannot be undone, so it pays for the mutex.
 
 ## vars() and copy.copy() in a hot path
 
-Eight to ten nanoseconds per access only shows up with an attribute in the innermost loop of
+Eight to ten nanoseconds per round-trip only shows up with an attribute in the innermost loop of
 something that runs millions of times and does nearly nothing else per iteration, which
 describes this benchmark and very little production code. Hoisting a lookup out of a loop
 that runs forty times buys nanoseconds and costs you a worse-reading diff.
@@ -311,11 +311,11 @@ slow path to fall into.
 ## The explanation stopped being true in 3.11
 
 Before 3.11 the explanation named the right mechanism, because attribute access really did
-go through the instance dict. PEP 659 replaced that with a version-guarded read into a
+go through the instance dict. 3.11 replaced that with a version-guarded read into a
 values array, and the free-threaded build adds an atomic load on top of it plus a mutex on
 the write. Through all of that the benchmark kept agreeing with the conclusion, so nothing
 forced anyone to recheck the reason.
 
-Once something reads `__dict__`, the dict probe is back and the old explanation is accurate
-again. The advice never mentions that case, because at the time there was no other case to
-distinguish it from.
+Once something reads `__dict__`, the specialization is gone and the tip is worth three times
+what it was. The advice never mentions that case, because at the time there was no other
+case to distinguish it from.
