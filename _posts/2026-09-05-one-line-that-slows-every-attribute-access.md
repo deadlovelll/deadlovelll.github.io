@@ -172,7 +172,7 @@ copy.copy(o)
 
 `copy.copy` is the one that matters. Nobody reads a shallow copy as a performance decision,
 and it permanently makes every subsequent attribute access on that object about three times
-dearer.
+slower.
 
 ## LOAD_ATTR_WITH_HINT declines split tables
 
@@ -289,16 +289,16 @@ op(_GUARD_TYPE_VERSION_AND_LOCK, (type_version/2, owner -- owner)) {
 ```
 
 Under the GIL that expands to the literal `1` and the optimizer deletes it. Without the GIL
-it is an uncontended mutex acquire, cheap, paid a million times. The asymmetry is deliberate:
-the read does not take the lock and the write does. A read that cannot safely take a
-reference detects that and falls back through `DEOPT_IF`. A write that tears an inline
-values array cannot be undone, so it pays for the mutex.
+it is an uncontended mutex acquire, cheap, paid a million times. Only the write takes the
+lock. A read that cannot safely take a reference detects that and falls back through
+`DEOPT_IF`, while a write that tears an inline values array cannot be undone, so it pays for
+the mutex.
 
 ## vars() and copy.copy() in a hot path
 
 Eight to ten nanoseconds per round-trip only shows up with an attribute in the innermost loop of
 something that runs millions of times and does nearly nothing else per iteration, which
-describes this benchmark and very little production code. Hoisting a lookup out of a loop
+describes this benchmark and little production code. Hoisting a lookup out of a loop
 that runs forty times buys nanoseconds and costs you a worse-reading diff.
 
 The materialization half matters more, because nothing about it looks like a performance
@@ -310,8 +310,8 @@ slow path to fall into.
 
 ## The explanation stopped being true in 3.11
 
-Before 3.11 the explanation named the right mechanism, because attribute access really did
-go through the instance dict. 3.11 replaced that with a version-guarded read into a
+Before 3.11 the explanation named the right mechanism, because attribute access went through
+the instance dict. 3.11 replaced that with a version-guarded read into a
 values array, and the free-threaded build adds an atomic load on top of it plus a mutex on
 the write. Through all of that the benchmark kept agreeing with the conclusion, so nothing
 forced anyone to recheck the reason.
