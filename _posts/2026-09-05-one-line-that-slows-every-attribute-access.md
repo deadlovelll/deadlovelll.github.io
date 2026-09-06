@@ -1,7 +1,7 @@
 ---
 layout: post
-title: The line that makes every attribute access 50% slower
-subtitle: Since 3.11 attributes live in an inline values array, and reading __dict__ once puts them back in a real dict for good
+title: Reading __dict__ once permanently deoptimizes attribute access
+subtitle: Since 3.13 attributes live in an inline values array, and reading __dict__ once hands that array to a real dict for good
 tags: [cpython, performance, free-threading, bytecode]
 ---
 
@@ -63,7 +63,7 @@ STORE_ATTR_INSTANCE_VALUE    value
 `LOAD_ATTR` is gone, and what replaced it never touches a hash table:
 
 ```c
-op(_LOAD_ATTR_INSTANCE_VALUE, (offset/1, owner -- attr, o)) {
+op(_LOAD_ATTR_INSTANCE_VALUE, (offset/1, owner -- attr)) {
     PyObject *owner_o = PyStackRef_AsPyObjectBorrow(owner);
     PyObject **value_ptr = (PyObject**)(((char *)owner_o) + offset);
     PyObject *attr_o = FT_ATOMIC_LOAD_PTR_ACQUIRE(*value_ptr);
@@ -72,10 +72,10 @@ op(_LOAD_ATTR_INSTANCE_VALUE, (offset/1, owner -- attr, o)) {
 ```
 
 A fixed byte offset into the object, baked into the instruction's inline cache the first
-time it ran. Since PEP 659 and `Py_TPFLAGS_MANAGED_DICT`, an ordinary instance keeps its
+time it ran. Since PEP 659 and `Py_TPFLAGS_INLINE_VALUES`, an ordinary instance keeps its
 attributes in an inline values array, and the specialized opcode reads straight out of it
-after checking the type's version tag, so the `__dict__` everyone is picturing does not
-exist yet.
+after checking the type's version tag and that the values are still there, so the
+`__dict__` everyone is picturing does not exist yet.
 
 So where do the 8 nanoseconds go? I added a control that keeps the loop and the iteration
 count but has no attribute in it.
@@ -107,7 +107,7 @@ somewhere else entirely:
 
 ```python
 o = Materialized()
-o.__dict__            # <- that is it
+o.__dict__
 ```
 
 | variant | GIL | free-threaded |
@@ -116,7 +116,7 @@ o.__dict__            # <- that is it
 | `materialized` | 50.6 ms +- 1.2 | 59.4 ms +- 0.5 |
 | ratio | **1.54 +- 0.04** | **1.75 +- 0.02** |
 
-Reading `__dict__` materializes it, the inline values are marked invalid, and every
+Reading `__dict__` materializes it, the new dict wraps the same values array, and every
 attribute access on that object goes back to a real dict for the rest of its life. The loop
 that took 33 ms takes 51, an 18 ms penalty against the 8 ms hoisting saves.
 
@@ -148,7 +148,6 @@ object shape stays cheap without inline values. It is never selected here, and
 `specialize_dict_access_hint` says why in its first four lines:
 
 ```c
-    // We found an instance with a __dict__.
     if (_PyDict_HasSplitTable(dict)) {
         SPECIALIZATION_FAIL(base_op, SPEC_FAIL_ATTR_SPLIT_DICT);
         return 0;
@@ -158,8 +157,9 @@ object shape stays cheap without inline values. It is never selected here, and
 Materializing the `__dict__` of an object that had inline values produces a dict with a
 *split* table - keys shared with the type, values in the instance - and the hint
 specialization declines split tables outright. So the object ends up with no specialization
-at all: `INSTANCE_VALUE` needs the inline values it no longer has, and `WITH_HINT` refuses
-the split table it now has.
+at all, and the two opcodes get there by different routes: `STORE_ATTR` is the one that
+reaches the hint path and is refused for the split table, while `LOAD_ATTR` never gets that
+far - it takes an earlier branch that fails as soon as it sees a non-NULL dict.
 
 I assumed one materialized instance would poison the shared code object for every other
 instance of the class, since the inline cache belongs to the instruction and not the
@@ -217,12 +217,17 @@ On the write side, `STORE_ATTR_INSTANCE_VALUE` takes a lock on the object:
 ```c
 macro(STORE_ATTR_INSTANCE_VALUE) =
     unused/1 +
-    _RECORD_TOS_TYPE +
-    _LOCK_OBJECT +
-    _GUARD_TYPE_VERSION_LOCKED +
+    _GUARD_TYPE_VERSION_AND_LOCK +
     _GUARD_DORV_NO_DICT +
-    _STORE_ATTR_INSTANCE_VALUE +
-    POP_TOP;
+    _STORE_ATTR_INSTANCE_VALUE;
+```
+
+```c
+op(_GUARD_TYPE_VERSION_AND_LOCK, (type_version/2, owner -- owner)) {
+    PyObject *owner_o = PyStackRef_AsPyObjectBorrow(owner);
+    assert(type_version != 0);
+    EXIT_IF(!LOCK_OBJECT(owner_o));
+    ...
 ```
 
 ```c
