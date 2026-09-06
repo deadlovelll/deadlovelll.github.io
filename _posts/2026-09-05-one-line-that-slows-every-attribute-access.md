@@ -1,7 +1,7 @@
 ---
 layout: post
 title: Reading __dict__ once permanently deoptimizes attribute access
-subtitle: Since 3.13 attributes live in an inline values array, and reading __dict__ once hands that array to a real dict for good
+subtitle: Since 3.11 attribute access has not been a dict lookup, and reading __dict__ once hands the values array to a real dict for good
 tags: [cpython, performance, free-threading, bytecode]
 ---
 
@@ -35,14 +35,32 @@ costs more than the hoisting saves.
 Here is the cold disassembly of `Attr.process`, which does look like a lookup:
 
 ```console
-LOAD_FAST_BORROW         self
-COPY
-LOAD_ATTR                value
-LOAD_FAST_BORROW         i
-BINARY_OP                +=
-SWAP
-STORE_ATTR               value
-JUMP_BACKWARD            to L1
+  3           RESUME                   0
+
+  4           LOAD_SMALL_INT           0
+              LOAD_FAST_BORROW         0 (self)
+              STORE_ATTR               0 (value)
+
+  5           LOAD_GLOBAL              3 (range + NULL)
+              LOAD_CONST               1 (1000000)
+              CALL                     1
+              GET_ITER
+      L1:     FOR_ITER                28 (to L2)
+              STORE_FAST               1 (i)
+
+  6           LOAD_FAST_BORROW         0 (self)
+              COPY                     1
+              LOAD_ATTR                0 (value)
+              LOAD_FAST_BORROW         1 (i)
+              BINARY_OP               13 (+=)
+              SWAP                     2
+              STORE_ATTR               0 (value)
+              JUMP_BACKWARD           30 (to L1)
+
+  5   L2:     END_FOR
+              POP_ITER
+              LOAD_CONST               2 (None)
+              RETURN_VALUE
 ```
 
 The adaptive interpreter rewrites that after a few runs, so ask `dis` what it settled on
@@ -55,9 +73,32 @@ dis.dis(Attr.process, adaptive=True)
 ```
 
 ```console
-LOAD_ATTR_INSTANCE_VALUE     value
-BINARY_OP_ADD_INT            +=
-STORE_ATTR_INSTANCE_VALUE    value
+  3           RESUME_CHECK             0
+
+  4           LOAD_SMALL_INT           0
+              LOAD_FAST_BORROW         0 (self)
+              STORE_ATTR               0 (value)
+
+  5           LOAD_GLOBAL              3 (range + NULL)
+              LOAD_CONST_MORTAL        1 (1000000)
+              CALL                     1
+              GET_ITER
+      L1:     FOR_ITER_RANGE          28 (to L2)
+              STORE_FAST               1 (i)
+
+  6           LOAD_FAST_BORROW         0 (self)
+              COPY                     1
+              LOAD_ATTR_INSTANCE_VALUE 0 (value)
+              LOAD_FAST_BORROW         1 (i)
+              BINARY_OP_ADD_INT       13 (+=)
+              SWAP                     2
+              STORE_ATTR_INSTANCE_VALUE 0 (value)
+              JUMP_BACKWARD_NO_JIT    30 (to L1)
+
+  5   L2:     END_FOR
+              POP_ITER
+              LOAD_CONST_IMMORTAL      2 (None)
+              RETURN_VALUE
 ```
 
 `LOAD_ATTR` is gone, and what replaced it never touches a hash table:
@@ -77,7 +118,7 @@ attributes in an inline values array, and the specialized opcode reads straight 
 after checking the type's version tag and that the values are still there, so the
 `__dict__` everyone is picturing does not exist yet.
 
-So where do the 8 nanoseconds go? I added a control that keeps the loop and the iteration
+To find where the 8 nanoseconds go, I added a control that keeps the loop and the iteration
 count but has no attribute in it.
 
 ```python
@@ -92,11 +133,11 @@ class Floor:
 | variant | GIL | free-threaded |
 |---|---|---|
 | `attr` | 33.0 ms +- 0.5 | 34.0 ms +- 0.3 |
-| `hoisted` | 24.8 ms +- 0.7 | 23.9 ms +- 0.2 |
+| `hoisted` | 24.8 ms +- 0.7 | 23.9 ms +- 0.1 |
 | `floor` | 24.3 ms +- 0.8 | 23.8 ms +- 0.1 |
 
 `hoisted / floor` is 1.02 +- 0.04 on the GIL build and 1.00 +- 0.01 without it. Take the
-attribute out and what is left is the bare loop: that ~24 ms is `FOR_ITER_RANGE` and
+attribute out and what is left is the bare loop: that ~24 ms is mostly `FOR_ITER_RANGE` and
 `BINARY_OP_ADD_INT`. The 1.33x is 8 ms of attribute round-trips on top of 24 ms of loop
 that hoisting does not touch.
 
@@ -118,7 +159,7 @@ o.__dict__
 
 Reading `__dict__` materializes it, the new dict wraps the same values array, and every
 attribute access on that object goes back to a real dict for the rest of its life. The loop
-that took 33 ms takes 51, an 18 ms penalty against the 8 ms hoisting saves.
+that took 33 ms takes 51 ms. That is an 18 ms penalty, where hoisting saved 8 ms.
 
 Other things materialize it too:
 
@@ -130,12 +171,13 @@ copy.copy(o)
 ```
 
 `copy.copy` is the one that matters. Nobody reads a shallow copy as a performance decision,
-and it permanently makes every subsequent attribute access on that object about 50% dearer.
+and it permanently makes every subsequent attribute access on that object about three times
+dearer.
 
-## Why there is no middle specialization
+## LOAD_ATTR_WITH_HINT declines split tables
 
 `dis` says the loop is back to plain `LOAD_ATTR` and `STORE_ATTR`, fully generic. A slower
-specialization exists and is exactly for this case:
+specialization exists for instances that do have a dict:
 
 ```c
 try_instance:
@@ -144,8 +186,8 @@ try_instance:
 ```
 
 `LOAD_ATTR_WITH_HINT` caches the index of the key in the dict, so a lookup on a known
-object shape stays cheap without inline values. It is never selected here, and
-`specialize_dict_access_hint` says why in its first four lines:
+object shape stays cheap without inline values. It is never selected here, and on the store
+side `specialize_dict_access_hint` says why in its first check:
 
 ```c
     if (_PyDict_HasSplitTable(dict)) {
@@ -162,8 +204,8 @@ reaches the hint path and is refused for the split table, while `LOAD_ATTR` neve
 far - it takes an earlier branch that fails as soon as it sees a non-NULL dict.
 
 I assumed one materialized instance would poison the shared code object for every other
-instance of the class, since the inline cache belongs to the instruction and not the
-object. It does deoptimize while the materialized instance is running, but clean instances
+instance of the class, since every instance runs through the same instruction with the same
+inline cache. It does deoptimize while the materialized instance is running, but clean instances
 re-specialize it right back, and a clean instance running through a "poisoned" code object
 measured 1.02x, which is to say nothing.
 
@@ -174,16 +216,24 @@ exactly the same speed. What `__slots__` buys is the absent
 
 ## Without the GIL, both effects grow
 
-Every benchmark above, rebuilt with `--disable-gil` and rerun on the same machine:
+Every benchmark above, rerun on the same machine on a build configured with `--disable-gil`:
 
 ```console
-$ pyperf compare_to gil.json ft.json --table
-| Benchmark    | gil     | ft                    |
-| attr         | 33.0 ms | 34.0 ms: 1.03x slower |
-| hoisted      | 24.8 ms | 23.9 ms: 1.04x faster |
-| floor        | 24.3 ms | 23.8 ms: 1.02x faster |
-| materialized | 50.6 ms | 59.4 ms: 1.17x slower |
-| slots        | 32.3 ms | 33.9 ms: 1.05x slower |
++----------------+---------+-----------------------+
+| Benchmark      | gil     | ft                    |
++================+=========+=======================+
+| attr           | 33.0 ms | 34.0 ms: 1.03x slower |
++----------------+---------+-----------------------+
+| hoisted        | 24.8 ms | 23.9 ms: 1.04x faster |
++----------------+---------+-----------------------+
+| floor          | 24.3 ms | 23.8 ms: 1.02x faster |
++----------------+---------+-----------------------+
+| materialized   | 50.6 ms | 59.4 ms: 1.17x slower |
++----------------+---------+-----------------------+
+| slots          | 32.3 ms | 33.9 ms: 1.05x slower |
++----------------+---------+-----------------------+
+| Geometric mean | (ref)   | 1.04x slower          |
++----------------+---------+-----------------------+
 ```
 
 The loop itself is *faster* without the GIL, and what costs more is attribute access: the
@@ -240,11 +290,11 @@ op(_GUARD_TYPE_VERSION_AND_LOCK, (type_version/2, owner -- owner)) {
 
 Under the GIL that expands to the literal `1` and the optimizer deletes it. Without the GIL
 it is an uncontended mutex acquire, cheap, paid a million times. The asymmetry is deliberate:
-the read does not take the lock and the write does. A read that picks up the wrong value can
-detect that and retry through `DEOPT_IF`. A write that tears an inline values array cannot
-be undone, so it pays for the mutex.
+the read does not take the lock and the write does. A read that cannot safely take a
+reference detects that and falls back through `DEOPT_IF`. A write that tears an inline
+values array cannot be undone, so it pays for the mutex.
 
-## When this is worth acting on
+## vars() and copy.copy() in a hot path
 
 Eight to ten nanoseconds per access only shows up with an attribute in the innermost loop of
 something that runs millions of times and does nearly nothing else per iteration, which
@@ -258,14 +308,14 @@ hot path calls `vars()` or `copy.copy()` on the objects it is iterating over,
 that is worth knowing, and `__slots__` is the fix, since a class with no `__dict__` has no
 slow path to fall into.
 
-## Where the old explanation is still true
+## The explanation stopped being true in 3.11
 
 Before 3.11 the explanation named the right mechanism, because attribute access really did
-go through the instance dict. PEP 659 replaced that with a version-guarded read at a fixed
-offset, and the free-threaded build adds an atomic load on top of it plus a mutex on the
-write. The conclusion survived all of it and the reason did not, and nobody noticed because
-the benchmark still came out the same way.
+go through the instance dict. PEP 659 replaced that with a version-guarded read into a
+values array, and the free-threaded build adds an atomic load on top of it plus a mutex on
+the write. Through all of that the benchmark kept agreeing with the conclusion, so nothing
+forced anyone to recheck the reason.
 
-The moment anything reads `__dict__` the old explanation describes a real cost again. The
-advice never mentions that case, because at the time there was no other case to distinguish
-it from.
+Once something reads `__dict__`, the dict probe is back and the old explanation is accurate
+again. The advice never mentions that case, because at the time there was no other case to
+distinguish it from.
