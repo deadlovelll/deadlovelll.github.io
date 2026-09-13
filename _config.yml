@@ -12,6 +12,13 @@ title: Timofei Ivankov
 # Your name to show in the footer
 author: Timofei Ivankov
 
+# Canonical address of the site. Beautiful Jekyll feeds this into `absolute_url`,
+# which builds og:url, og:image and <link rel="canonical">. GitHub Pages guesses it
+# for you on its own builds; setting it here means local builds and any future
+# Actions-based deploy produce the same absolute URLs instead of bare paths.
+url: "https://deadlovelll.github.io"
+baseurl: ""
+
 ###############################################
 # --- List of links in the navigation bar --- #
 ###############################################
@@ -140,11 +147,15 @@ defaults:
       layout: "post"
       comments: false
       social-share: true
+      # Fallback preview card for LinkedIn/X/Slack. Override per post with
+      # `share-img: /assets/img/<name>.png` in that post's front matter.
+      share-img: "/assets/img/og-default.png"
   -
     scope:
       path: ""
     values:
       layout: "page"
+      share-img: "/assets/img/og-default.png"
 
 exclude:
   - CHANGELOG.md
