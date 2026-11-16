@@ -5,8 +5,9 @@ subtitle: Failed context entry during eager start left the child recorded as the
 tags: [cpython, asyncio, contextvars, debugging]
 ---
 
-Here is a program that catches the error from a failed task constructor, then
-hangs at its next `await`:
+I found this bug while fuzzing parts of asyncio. A failed task constructor
+could leave the event loop stuck, even if the caller caught the exception.
+This program catches the error, then hangs at its next `await`:
 
 ```python
 import asyncio
@@ -33,33 +34,33 @@ asyncio.run(main())
 ```
 
 Running this with CPython 3.14.6 gets as far as `asyncio.sleep(0)`, then
-hangs with the following traceback:
+hangs with the following traceback (file paths shortened here and below):
 
 ```text
 Exception in callback <_asyncio.TaskStepMethWrapper object at 0x1059db9d0>()
 handle: <Handle <_asyncio.TaskStepMethWrapper object at 0x1059db9d0>()>
 Traceback (most recent call last):
-  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/events.py", line 94, in _run
+  File ".../asyncio/events.py", line 94, in _run
     self._context.run(self._callback, *self._args)
     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: Invalid attempt to leave task <Task pending name='Task-1' coro=<main() running at /tmp/eager-start-article-20261116/repro.py:18> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181]> while task <Task pending name='Task-2' coro=<child() done, defined at /tmp/eager-start-article-20261116/repro.py:4>> is entered.
+RuntimeError: Invalid attempt to leave task <Task pending name='Task-1' coro=<main() running at .../repro.py:18> cb=[_run_until_complete_cb() at .../asyncio/base_events.py:181]> while task <Task pending name='Task-2' coro=<child() done, defined at .../repro.py:4>> is entered.
 ```
 
-The `RuntimeError` we caught came from trying to enter the same `Context`
-twice. `ctx.run` has already entered it, and `eager_start=True` makes the task
-try to enter it again before `ctx.run` can return. Python
+Trying to enter the same `Context` twice explains the `RuntimeError` we
+caught: `ctx.run` has already entered it, and `eager_start=True` makes the
+task try to enter it again before `ctx.run` can return. Python
 [forbids that][context-docs], so the constructor is right to raise.
 
-The second error occurs when leaving `main`, but the runtime has `child`
-recorded as current. The child's constructor never returned, and its
-coroutine has not even reached `pass`.
+But `main` is now leaving while the runtime still has `child` as current,
+even though the child's constructor never returned and its coroutine has
+not reached `pass`.
 
 ## Eager start changes the current task before entering the context
 
-An eager task starts running its coroutine inside the constructor, until it
-finishes or actually suspends. That means the parent can still be inside
-`Task(...)` while the child is executing, and `asyncio.current_task()` has
-to report the child during that interval.
+An eager task runs its coroutine inside the constructor until it finishes
+or actually suspends, so the parent can still be inside `Task(...)` while
+the child is executing. During that interval, `asyncio.current_task()` has
+to report the child.
 
 In the C implementation, `task_eager_start` does that with
 [`swap_current_task`][before-source]: it saves the parent in `prevtask` and
@@ -82,31 +83,27 @@ if (_PyContext_Enter(&ts->base, task->task_context) == -1) {
 }
 ```
 
-`_PyContext_Enter` fails. The function decrefs the parent and returns, leaving
-the child current and registered. Decrementing `prevtask`'s reference count
-does nothing to the field where the child was installed.
+When `_PyContext_Enter` fails, cleanup consists of a decref of `prevtask`,
+and the function returns with the child still current and registered.
+Restoring the parent happens further down, after the first coroutine step,
+which this error path never reaches.
 
-The code to restore the parent was further down, after the first coroutine
-step. The context failure returned before any of it could run.
-
-The constructor has failed, but the state change it made is still visible
-to the code that called it. Save `parent = asyncio.current_task()` before
-the `try` and put this in the handler:
+Save `parent = asyncio.current_task()` before the `try` and put this in the
+handler:
 
 ```python
 except RuntimeError:
     print(asyncio.current_task() is parent, flush=True)
 ```
 
-It prints `False` even though the parent is executing the print. The child
-is still recorded as current. The enclosing `ctx.run` has unwound its own
-context change correctly, but asyncio has not restored the current task.
+It prints `False`, from inside the parent. By then `ctx.run` has unwound its
+own context change, but `asyncio_running_task` still points to the child.
 
 ## The next await fails in `leave_task`
 
-The parent can execute its exception handler because it has not suspended
-yet. The C call raised into the Python frame that was already running, and
-the `except` block is just more code in that frame.
+So far the parent has not suspended: the C call raised into the Python
+frame that was already running, and executing the `except` block just
+continues in that frame.
 
 Then `await asyncio.sleep(0)` yields. Asyncio finishes the parent's step and
 calls `leave_task`, which checks this:
@@ -117,38 +114,31 @@ if (ts->asyncio_running_task != task) {
 }
 ```
 
-With `task` pointing to the parent and `asyncio_running_task` to the child,
-the guard raises, and the event loop logs the callback error. On the next
-attempt to resume the parent, `enter_task` finds that a task is already
-current and refuses to enter another one:
+After logging this error, the loop tries to resume the parent, but
+`enter_task` also fails because the child is still current:
 
 ```text
 Exception in callback <_asyncio.TaskStepMethWrapper object at 0x1059dbbb0>()
 handle: <Handle <_asyncio.TaskStepMethWrapper object at 0x1059dbbb0>()>
 Traceback (most recent call last):
-  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/events.py", line 94, in _run
+  File ".../asyncio/events.py", line 94, in _run
     self._context.run(self._callback, *self._args)
     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: Cannot enter into task <Task pending name='Task-1' coro=<main() running at /tmp/eager-start-article-20261116/repro.py:18> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181]> while another task <Task pending name='Task-2' coro=<child() done, defined at /tmp/eager-start-article-20261116/repro.py:4>> is being executed.
+RuntimeError: Cannot enter into task <Task pending name='Task-1' coro=<main() running at .../repro.py:18> cb=[_run_until_complete_cb() at .../asyncio/base_events.py:181]> while another task <Task pending name='Task-2' coro=<child() done, defined at .../repro.py:4>> is being executed.
 ```
 
-The loop still dispatches ordinary callbacks, but attempts to resume `main`
-fail because `asyncio_running_task` still points to the child. This leaves
-`asyncio.run` waiting for `main` to finish. A timeout implemented as another
-coroutine also depends on task stepping, so the reproduction needs an
+Ordinary callbacks still run, but every attempt to resume `main` fails on
+the stale child in `asyncio_running_task`, leaving `asyncio.run` waiting
+for a task that cannot finish. Even a timeout implemented as another
+coroutine needs task stepping to work, so this reproduction needs an
 external watchdog.
-
-Catching the constructor's exception does not restore the current task,
-and the exception handler has no reason to expect that it has changed.
 
 ## Restore the parent on the way out
 
-My [original report][issue] also had a shorter way to reach this path:
-`context=2.14`. Checking the argument's type catches that at construction.
-The example above passes a `Context` instance, though, and still fails to enter
-it. Validation alone leaves the bug in place.
-
-The error path has to undo the setup it has already performed:
+In my [original report][issue], I also used `context=2.14` to reach this
+path. A type check catches that at construction, but the example above
+passes a `Context` instance and fails because it is already entered, so
+the error path still has to undo the current-task swap and registration:
 
 ```c
 if (_PyContext_Enter(&ts->base, task->task_context) == -1) {
@@ -161,16 +151,14 @@ if (_PyContext_Enter(&ts->base, task->task_context) == -1) {
 }
 ```
 
-Swap the parent back in, release the displaced reference to the child,
-unregister the child, then return the original error. The log flag also
-suppresses the pending-task warning for the task that could not be
-constructed. The caller still gets `RuntimeError`, with its own task
-current again.
+Setting `task_log_destroy_pending` to zero suppresses the pending-task warning for
+the task that could not be constructed. Now the caller gets `RuntimeError`
+with its own task current again.
 
-The Python task implementation already had `finally` blocks around the
-current-task swap. The missing restoration was in the C implementation.
-The Python-side changes add the context type check and suppress the warning
-on failed eager construction.
+On the Python side, `finally` blocks already restored the current task,
+so the rollback fix belongs in the C implementation. Python-side changes
+add the context type check and suppress the warning on failed eager
+construction.
 
 [#157302][pr] landed on 19 September and was backported to
 [3.13][backport-313], [3.14][backport-314] and [3.15][backport-315]. The
